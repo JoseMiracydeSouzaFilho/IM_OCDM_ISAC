@@ -1,0 +1,78 @@
+%% Main Script: ISAC System with IM-OCDM and LFM Radar
+clc; clear; close all;
+
+%% 1. System Parameters
+% Communication
+Nc_total = 256;             % Total subchirps
+Nc_comm = 128;              % Subchirps for communication
+Nc_radar = Nc_total - Nc_comm; % Subchirps for radar
+g = 8;                      % Number of sub-blocks
+k = 8;                      % Active subchirps per sub-block
+M = 16;                     % 16-QAM modulation
+SNR_dB = 20;                % Signal-to-noise ratio (dB)
+
+% Radar
+radar_BW = 1e6;             % 1 MHz bandwidth
+Fs = 2e6;                   % Sampling frequency
+pulse_width = 64e-6;        % Pulse width
+PRP = 480e-6;               % Pulse repetition period
+target_range = 3600;        % 3.6 km
+target_speed = 40;          % 40 m/s
+
+%% 2. Generate IM-OCDM Communication Signal
+% Generate active/inactive subchirps
+[active_subchirps, radar_subchirps] = gen_im_patterns(Nc_comm, g, k);
+
+% Generate random bits and map to 16-QAM symbols
+n_c = Nc_comm / g;
+index_bits_per_block = floor(log2(nchoosek(n_c, k))); 
+n_bits = g * (index_bits_per_block + k*log2(M)); 
+input_bits = randi([0 1], 1, n_bits); 
+
+% Reshape bits into a matrix with log2(M) rows (required by qammod)
+bits_per_symbol = log2(M);
+input_matrix = reshape(input_bits, bits_per_symbol, []); % 4x90 for 16-QAM
+
+% Map to 16-QAM symbols
+symbols = qammod(input_matrix, M, 'InputType', 'bit', 'UnitAveragePower', true);
+
+% Map symbols to active subchirps
+comm_signal = zeros(Nc_total, 1);
+comm_signal(active_subchirps) = symbols;
+
+%% 3. Generate LFM Radar Signal
+lfm_signal = generate_lfm_chirp(radar_BW, pulse_width, Fs, Nc_radar);
+
+% Map radar signal to inactive subchirps
+full_signal = comm_signal;
+full_signal(radar_subchirps) = lfm_signal;
+
+%% 4. Simulate Noisy Channel
+received_signal = awgn(full_signal, SNR_dB, 'measured');
+
+%% 5. Receiver Processing
+% Separate communication and radar signals
+received_comm = received_signal(active_subchirps);
+received_radar = received_signal(radar_subchirps);
+
+% Demodulate communication signal
+demod_bits = qamdemod(received_comm, M, 'OutputType', 'bit', 'UnitAveragePower', true);
+
+% Process radar signal
+[range_est, velocity_est] = process_radar(received_radar, lfm_signal, Fs, pulse_width);
+
+%% 6. Results and Visualization
+% Communication: Constellation plot
+scatterplot(received_comm);
+title('Received 16QAM Constellation (Communication)');
+
+% Radar: Plot matched filter output
+t = (0:Nc_radar-1)/Fs;
+figure;
+plot(t, abs(received_radar));
+xlabel('Time (s)'); ylabel('Amplitude');
+title('Radar Echo Signal (Time Domain)');
+
+% Display radar results
+fprintf('True Range: %.2f km, Estimated Range: %.2f km\n', target_range/1e3, range_est/1e3);
+fprintf('True Speed: %.2f m/s, Estimated Speed: %.2f m/s\n', target_speed, velocity_est);

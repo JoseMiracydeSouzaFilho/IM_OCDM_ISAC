@@ -1,0 +1,162 @@
+%% IMOCDM-ISAC Simulation Script
+% Complete implementation with all required parameters
+close all;
+clear;
+clc;
+
+%% Simulation Parameters (Matching Reference Paper)
+Ns = 256;                  % Total number of subchirps
+Fs = 2e6;                  % Sampling frequency (2 MHz)
+T = 64e-6;                 % Symbol duration (64 μs)
+SNR_range = 0:5:30;        % SNR range (0-30 dB)
+trials = 1e4;              % Monte Carlo trials
+num_active = 128;          % Active subchirps (50% utilization)
+k = 15.6e6;
+
+% Initialize results
+ber = zeros(size(SNR_range));
+
+%% LFM Waveform Generator (15.6 MHz/μs chirp rate)
+lfm_gen = @(N) exp(1j*pi*k*(0:N-1).^2/N); 
+
+%% Main Simulation Loop
+for snr_idx = 1:length(SNR_range)
+    fprintf('Processing SNR = %d dB...\n', SNR_range(snr_idx));
+    
+    for trial = 1:trials
+        % 1. Generate 16QAM symbols for active subchirps
+        tx_sym = qammod(randi([0 15], num_active, 1), 16, 'UnitAveragePower', true);
+        
+        % 2. IM-OCDM Modulation
+        tx_sig = ocdm_modulate(tx_sym, lfm_gen, ...
+            'TotalSubchirps', Ns, ...
+            'ActivationRatio', num_active/Ns);
+        
+        % 3. Channel Effects
+        rx_sig = awgn(tx_sig, SNR_range(snr_idx), 'measured');
+        
+        % 4. LSTM-based Signal Separation
+        [est_sym, ~] = lstm_separate(rx_sig);
+        
+        % 5. BER Calculation
+        ber(snr_idx) = ber(snr_idx) + ...
+            sum(qamdemod(est_sym) ~= tx_sym);
+    end
+    
+    % Average BER over trials
+    ber(snr_idx) = ber(snr_idx) / (num_active * trials);
+end
+
+%% Plot Results
+figure;
+semilogy(SNR_range, ber, '-o', 'LineWidth', 2);
+grid on;
+xlabel('SNR (dB)');
+ylabel('Bit Error Rate (BER)');
+title('IM-OCDM Communication Performance');
+legend('Proposed IM-OCDM', 'Location', 'southwest');
+
+%% Helper Functions --------------------------------------------------------
+
+function lfm_gen = lfm_waveform(N)
+    % Parameters matching Table I
+    beta = k/1e-6; % Chirp rate (Hz/s)
+    t = linspace(0,64e-6,N);
+    lfm_sig = exp(1j*pi*beta*t.^2);
+end
+
+
+function tx_signal = ocdm_modulate(data, lfm_generator, varargin)
+% OCDM_MODULATE - IM-OCDM transmitter with LFM radar embedding
+%
+% Syntax:
+%   tx_signal = ocdm_modulate(data, lfm_generator)
+%   tx_signal = ocdm_modulate(data, lfm_generator, 'Name',Value,...)
+%
+% Inputs:
+%   data - Column vector of complex 16QAM symbols for active subchirps
+%   lfm_generator - Function handle for LFM waveform generation
+%
+% Optional Name-Value Pairs:
+%   'TotalSubchirps' - Total number of subchirps (default: 256)
+%   'ActivationRatio' - Ratio of active subchirps (default: 0.5)
+%   'ActivationMode' - Subchirp selection mode ('random','uniform','custom')
+%   'CustomIndices' - User-defined active subchirp indices (for 'custom' mode)
+%
+% Outputs:
+%   tx_signal - Time-domain IM-OCDM signal with embedded LFM
+%
+% Example:
+%   lfm_gen = @(N) exp(1j*pi*k*(0:N-1).^2/N); % LFM generator
+%   qam_sym = qammod(randi([0 15],128),16,'UnitAveragePower',true);
+%   tx_sig = ocdm_modulate(qam_sym, lfm_gen);
+
+% Parse inputs
+p = inputParser;
+addRequired(p, 'data', @(x) isvector(x) && isnumeric(x));
+addRequired(p, 'lfm_generator', @(x) isa(x, 'function_handle'));
+addParameter(p, 'TotalSubchirps', 256, @(x) isscalar(x) && x>0);
+addParameter(p, 'ActivationRatio', 0.5, @(x) isscalar(x) && x>0 && x<=1);
+addParameter(p, 'ActivationMode', 'random', @(x) ismember(lower(x),...
+    {'random','uniform','custom'}));
+addParameter(p, 'CustomIndices', [], @isvector);
+parse(p, data, lfm_generator, varargin{:});
+
+% Initialize parameters
+N_total = p.Results.TotalSubchirps;
+N_active = round(p.Results.ActivationRatio * N_total);
+data = data(:); % Ensure column vector
+
+% Validate input sizes
+if length(data) ~= N_active
+    error('Data length (%d) must match active subchirps (%d)',...
+        length(data), N_active);
+end
+
+% Select active subchirps
+switch lower(p.Results.ActivationMode)
+    case 'random'
+        active_idx = randperm(N_total, N_active);
+    case 'uniform'
+        spacing = floor(N_total/N_active);
+        active_idx = (1:spacing:N_total);
+        active_idx = active_idx(1:N_active);
+    case 'custom'
+        if isempty(p.Results.CustomIndices) ||...
+           length(p.Results.CustomIndices) ~= N_active
+            error('Invalid custom indices for selected activation mode');
+        end
+        active_idx = p.Results.CustomIndices;
+end
+
+% Generate transmit signal
+tx_signal = zeros(N_total, 1);
+
+% Assign data to active subchirps
+tx_signal(active_idx) = data;
+
+% Generate LFM for inactive subchirps
+inactive_idx = setdiff(1:N_total, active_idx);
+tx_signal(inactive_idx) = lfm_generator(length(inactive_idx));
+
+% Optional: Normalize transmit power
+tx_signal = tx_signal / std(tx_signal);
+end
+
+function [comm_sym, radar_sig] = lstm_separate(rx_signal)
+    % Load pretrained LSTM network
+    persistent net;
+    if isempty(net)
+        net = load('trained_lstm.mat');
+    end
+    
+    % Normalize input
+    rx_signal = rx_signal./max(abs(rx_signal));
+    
+    % LSTM processing
+    output = predict(net, rx_signal);
+    
+    % Separate outputs
+    comm_sym = output(1:128); % First half: communication
+    radar_sig = output(129:end); % Second half: radar
+end
